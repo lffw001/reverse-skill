@@ -22,6 +22,7 @@ CAPABILITIES=()
 START_SERVICES=false
 SKIP_REFRESH=false
 MANUAL_REQUIRED=false
+FAILED=false
 LAST_CAPABILITY_MANUAL=false
 
 for arg in "$@"; do
@@ -29,7 +30,7 @@ for arg in "$@"; do
         --start-services) START_SERVICES=true ;;
         --skip-refresh) SKIP_REFRESH=true ;;
         --list|-l)
-            echo "jadx apktool jeb-pro frida frida-ps idalib-mcp jshookmcp reqable-mcp anything-analyzer idapro r2 rabin2 adb agent-browser ghidra-mcp seclists proxycat burpsuite-mcp nmap pentestswarm bkcrack"
+            echo "jadx apktool jeb-pro frida frida-ps idalib-mcp jshookmcp reqable-mcp xquik-mcp anything-analyzer idapro r2 rabin2 adb agent-browser ghidra-mcp seclists proxycat burpsuite-mcp nmap pentestswarm bkcrack"
             echo "mcp-kali-server metasploitmcp hexstrike-ai adaptixc2 atomic-operator sstimap xsstrike wpprobe fluxion gef coercer evil-winrm-py netexec responder bloodhound certipy"
             exit 0
             ;;
@@ -55,7 +56,7 @@ if [[ ${#CAPABILITIES[@]} -eq 0 ]]; then
     echo "    adaptixc2 atomic-operator sstimap xsstrike wpprobe fluxion"
     echo ""
     echo "  [MCP 服务]"
-    echo "    jshookmcp reqable-mcp anything-analyzer idapro agent-browser"
+    echo "    jshookmcp reqable-mcp xquik-mcp anything-analyzer idapro agent-browser"
     echo "    mcp-kali-server metasploitmcp hexstrike-ai pentestswarm"
     echo ""
     echo "  [CTF 压缩包]"
@@ -131,11 +132,22 @@ install_git_commit() {
     local install_dir="$3"
 
     if [[ -d "$install_dir/.git" ]]; then
-        local current
-        current=$(git -C "$install_dir" rev-parse HEAD 2>/dev/null || true)
+        local current status
+        if ! current=$(git -C "$install_dir" rev-parse HEAD 2>/dev/null); then
+            log_err "无法解析现有 checkout HEAD: $install_dir"
+            return 1
+        fi
         if [[ "$current" != "$commit" ]]; then
             log_err "Existing checkout is not at pinned commit $commit: $install_dir"
             log_err "Move it aside explicitly, then retry; bootstrap will not overwrite local changes."
+            return 1
+        fi
+        if ! status=$(git -C "$install_dir" status --porcelain --untracked-files=all); then
+            log_err "无法检查 checkout 状态: $install_dir"
+            return 1
+        fi
+        if [[ -n "$status" ]]; then
+            log_err "现有 checkout 含本地修改，拒绝执行: $install_dir"
             return 1
         fi
         return 0
@@ -145,15 +157,33 @@ install_git_commit() {
         return 1
     fi
 
-    mkdir -p "$(dirname "$install_dir")"
-    git init -q "$install_dir"
-    git -C "$install_dir" remote add origin "$repo"
-    git -C "$install_dir" fetch --depth 1 origin "$commit"
-    git -C "$install_dir" checkout -q --detach FETCH_HEAD
-    local resolved
-    resolved=$(git -C "$install_dir" rev-parse HEAD)
+    local parent stage resolved status
+    parent=$(dirname "$install_dir")
+    mkdir -p "$parent"
+    stage=$(mktemp -d "$parent/.reverse-bootstrap-XXXXXX") || return 1
+    if ! git init -q "$stage" ||
+       ! git -C "$stage" remote add origin "$repo" ||
+       ! git -C "$stage" fetch --depth 1 origin "$commit" ||
+       ! git -C "$stage" checkout -q --detach FETCH_HEAD; then
+        rm -rf "$stage"
+        return 1
+    fi
+    if ! resolved=$(git -C "$stage" rev-parse HEAD); then
+        rm -rf "$stage"
+        return 1
+    fi
     if [[ "$resolved" != "$commit" ]]; then
         log_err "Pinned checkout verification failed (expected $commit, got $resolved)"
+        rm -rf "$stage"
+        return 1
+    fi
+    if ! status=$(git -C "$stage" status --porcelain --untracked-files=all) || [[ -n "$status" ]]; then
+        log_err "Staged checkout is not clean: $stage"
+        rm -rf "$stage"
+        return 1
+    fi
+    if ! mv -T "$stage" "$install_dir"; then
+        rm -rf "$stage"
         return 1
     fi
 }
@@ -328,6 +358,13 @@ manifest_field() {
     fi
     jq -er --arg name "$capability" --arg field "$field" \
         '.capabilities[] | select(.name == $name) | .[$field] // empty' "$KALI_MANIFEST"
+}
+
+manifest_dependency() {
+    local name="$1"
+    local field="$2"
+    jq -er --arg name "$name" --arg field "$field" \
+        '.bootstrapDependencies[$name][$field] // empty' "$KALI_MANIFEST"
 }
 
 install_manifest_release() {
@@ -583,6 +620,12 @@ EOF
                 "env": {"JSHOOK_BASE_PROFILE": "search"}
             }'
             ;;
+        xquik-mcp)
+            register_mcp_server "xquik" '{
+                "url": "https://xquik.com/mcp"
+            }'
+            log_info "Xquik remote MCP 已登记。请从 MCP 客户端完成 OAuth。"
+            ;;
         agent-browser)
             if ! command -v node &>/dev/null; then
                 install_apt_package "nodejs"
@@ -624,23 +667,30 @@ EOF
 # ─── 服务启动 ──────────────────────────────────────────────────────────────────────
 
 start_anything_analyzer() {
+    local repo_dir="$HOME/tools/anything-analyzer"
+    local repo commit
+    repo=$(manifest_field anything-analyzer repoUrl)
+    commit=$(manifest_field anything-analyzer pinnedCommit)
+    install_git_commit "$repo" "$commit" "$repo_dir" || return 1
+
     if test_tcp_port 23816 2>/dev/null; then
         log_ok "anything-analyzer 已在运行 (port 23816)"
         return 0
     fi
 
-    local repo_dir="$HOME/tools/anything-analyzer"
-
-    if [[ ! -d "$repo_dir" ]]; then
-        log_info "克隆 anything-analyzer ..."
-        git clone https://github.com/Mouseww/anything-analyzer.git "$repo_dir"
+    local pnpm_package pnpm_version current_pnpm_version=''
+    pnpm_package=$(manifest_dependency pnpm package) || return 1
+    pnpm_version=$(manifest_dependency pnpm version) || return 1
+    if command -v pnpm &>/dev/null; then
+        current_pnpm_version=$(pnpm --version 2>/dev/null | head -n1 | tr -d '[:space:]')
+    fi
+    if [[ "$current_pnpm_version" != "$pnpm_version" ]]; then
+        npm install -g "$pnpm_package" || return 1
     fi
 
-    if ! command -v pnpm &>/dev/null; then
-        npm install -g pnpm
-    fi
-
-    (cd "$repo_dir" && pnpm install && nohup pnpm dev > /tmp/anything-analyzer.log 2>&1 &)
+    (cd "$repo_dir" && pnpm install --frozen-lockfile) || return 1
+    install_git_commit "$repo" "$commit" "$repo_dir" || return 1
+    (cd "$repo_dir" && nohup pnpm dev > /tmp/anything-analyzer.log 2>&1 &)
 
     log_info "等待 anything-analyzer 启动 (port 23816) ..."
     if wait_for_port 23816 120; then
@@ -681,6 +731,7 @@ for cap in "${CAPABILITIES[@]}"; do
         fi
     else
         RESULTS+=("{\"name\":\"$cap\",\"status\":\"failed\"}")
+        FAILED=true
     fi
 done
 
@@ -691,7 +742,9 @@ if [[ "$SKIP_REFRESH" != "true" ]]; then
 fi
 
 final_exit_code=0
-if [[ "$MANUAL_REQUIRED" == "true" ]]; then
+if [[ "$FAILED" == "true" ]]; then
+    final_exit_code=1
+elif [[ "$MANUAL_REQUIRED" == "true" ]]; then
     final_exit_code=2
 fi
 
